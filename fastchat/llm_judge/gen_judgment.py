@@ -207,11 +207,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--first-n", type=int, help="A debug option. Only run the first `n` judgments."
     )
+    parser.add_argument(
+        "--answer-dir", type=str, help="The directory of model answers.", default=None
+    )
+    parser.add_argument(
+        "--output-file", type=str, help="The name of the output file", default=None
+    )
     args = parser.parse_args()
 
     question_file = f"data/{args.bench_name}/question.jsonl"
-    answer_dir = f"data/{args.bench_name}/model_answer"
     ref_answer_dir = f"data/{args.bench_name}/reference_answer"
+
+    if args.answer_dir is None:
+        answer_dir = f"data/{args.bench_name}/model_answer"
+    else:
+        answer_dir = args.answer_dir
 
     # Load questions
     questions = load_questions(question_file, None, None)
@@ -234,17 +244,23 @@ if __name__ == "__main__":
     if args.mode == "single":
         judges = make_judge_single(args.judge_model, judge_prompts)
         play_a_match_func = play_a_match_single
-        output_file = (
-            f"data/{args.bench_name}/model_judgment/{args.judge_model}_single.jsonl"
-        )
+        if args.output_file is None:
+            output_file = (
+                f"data/{args.bench_name}/model_judgment/{args.judge_model}_single.jsonl"
+            )
+        else:
+            output_file = args.output_file
         make_match_func = make_match_single
         baseline_model = None
     else:
         judges = make_judge_pairwise(args.judge_model, judge_prompts)
         play_a_match_func = play_a_match_pair
-        output_file = (
-            f"data/{args.bench_name}/model_judgment/{args.judge_model}_pair.jsonl"
-        )
+        if args.output_file is None:
+            output_file = (
+                f"data/{args.bench_name}/model_judgment/{args.judge_model}_pair.jsonl"
+            )
+        else:
+            output_file = args.output_file
         if args.mode == "pairwise-all":
             make_match_func = make_match_all_pairs
             baseline_model = None

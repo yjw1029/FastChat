@@ -24,6 +24,7 @@ from transformers import (
     T5Tokenizer,
 )
 
+from fastchat.model.llama_type_emb import LlamaModelWTypeEmbedCausalLM
 from fastchat.modules.gptq import GptqConfig, load_gptq_quantized
 from fastchat.conversation import Conversation, get_conv_template
 from fastchat.model.compression import load_compress_model
@@ -296,7 +297,7 @@ class VicunaAdapter(BaseModelAdapter):
     "Model adapater for vicuna-v1.1"
 
     def match(self, model_path: str):
-        return "vicuna" in model_path
+        return "vicuna" in model_path or "special_token" in model_path
 
     def load_model(self, model_path: str, from_pretrained_kwargs: dict):
         revision = from_pretrained_kwargs.get("revision", "main")
@@ -326,6 +327,25 @@ class VicunaAdapter(BaseModelAdapter):
                 "2. Use the old conversation template by `python3 -m fastchat.serve.cli --model-path /path/to/vicuna-v0 --conv-template conv_one_shot`\n"
                 "3. Downgrade fschat to fschat==0.1.10 (Not recommonded).\n"
             )
+
+class VicunaTypeEmb(VicunaAdapter):
+    "Model adapater for vicuna-v1.1"
+
+    def match(self, model_path: str):
+        return "type_embs" in model_path
+
+    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        revision = from_pretrained_kwargs.get("revision", "main")
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, use_fast=False, revision=revision
+        )
+        model = LlamaModelWTypeEmbedCausalLM.from_pretrained(
+            model_path,
+            low_cpu_mem_usage=True,
+            **from_pretrained_kwargs,
+        )
+        self.raise_warning_for_old_weights(model)
+        return model, tokenizer
 
 
 class T5Adapter(BaseModelAdapter):
@@ -832,6 +852,7 @@ class BaichuanAdapter(BaseModelAdapter):
 # Note: the registration order matters.
 # The one registered earlier has a higher matching priority.
 register_model_adapter(VicunaAdapter)
+register_model_adapter(VicunaTypeEmb)
 register_model_adapter(T5Adapter)
 register_model_adapter(KoalaAdapter)
 register_model_adapter(AlpacaAdapter)

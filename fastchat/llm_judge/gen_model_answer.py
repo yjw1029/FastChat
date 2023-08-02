@@ -206,6 +206,11 @@ if __name__ == "__main__":
         type=str,
         help="Maxmum GPU memory used for model weights per GPU.",
     )
+    parser.add_argument(
+        "--answer_file",
+        type=str,
+        default=None
+    )
     args = parser.parse_args()
 
     if args.num_gpus_total > 1:
