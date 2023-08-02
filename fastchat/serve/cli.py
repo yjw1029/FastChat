@@ -8,6 +8,8 @@ python3 -m fastchat.serve.cli --model lmsys/fastchat-t5-3b-v1.0
 Other commands:
 - Type "!!exit" or an empty line to exit.
 - Type "!!reset" to start a new conversation.
+- Type "!!save <filename>" to save the conversation history to a json file.
+- Type "!!load <filename>" to load a conversation history from a json file.
 """
 import argparse
 import os
@@ -25,12 +27,27 @@ from rich.markdown import Markdown
 
 from fastchat.model.model_adapter import add_model_args
 from fastchat.modules.gptq import GptqConfig
+from fastchat.modules.awq import AWQConfig
 from fastchat.serve.inference import ChatIO, chat_loop
 
 
 class SimpleChatIO(ChatIO):
+    def __init__(self, multiline: bool = False):
+        self._multiline = multiline
+
     def prompt_for_input(self, role) -> str:
-        return input(f"{role}: ")
+        if not self._multiline:
+            return input(f"{role}: ")
+
+        prompt_data = []
+        line = input(f"{role} [ctrl-d/z on empty line to end]: ")
+        while True:
+            prompt_data.append(line.strip())
+            try:
+                line = input()
+            except EOFError as e:
+                break
+        return "\n".join(prompt_data)
 
     def prompt_for_output(self, role: str):
         print(f"{role}: ", end="", flush=True)
@@ -47,6 +64,9 @@ class SimpleChatIO(ChatIO):
         print(" ".join(output_text[pre:]), flush=True)
         return " ".join(output_text)
 
+    def print_output(self, text: str):
+        print(text)
+
 
 class RichChatIO(ChatIO):
     bindings = KeyBindings()
@@ -58,7 +78,7 @@ class RichChatIO(ChatIO):
     def __init__(self, multiline: bool = False, mouse: bool = False):
         self._prompt_session = PromptSession(history=InMemoryHistory())
         self._completer = WordCompleter(
-            words=["!!exit", "!!reset"], pattern=re.compile("$")
+            words=["!!exit", "!!reset", "!!save", "!!load"], pattern=re.compile("$")
         )
         self._console = Console()
         self._multiline = multiline
@@ -118,18 +138,20 @@ class RichChatIO(ChatIO):
         self._console.print()
         return text
 
+    def print_output(self, text: str):
+        self.stream_output([{"text": text}])
+
 
 class ProgrammaticChatIO(ChatIO):
     def prompt_for_input(self, role) -> str:
-        print(f"[!OP:{role}]: ", end="", flush=True)
         contents = ""
-        # `end_sequence` is a randomly-generated, 16-digit number
-        #  that signals the end of a message. It is unlikely to occur in
+        # `end_sequence` signals the end of a message. It is unlikely to occur in
         #  message content.
-        end_sequence = "9745805894023423"
+        end_sequence = " __END_OF_A_MESSAGE_47582648__\n"
+        len_end = len(end_sequence)
         while True:
-            if len(contents) >= 16:
-                last_chars = contents[-16:]
+            if len(contents) >= len_end:
+                last_chars = contents[-len_end:]
                 if last_chars == end_sequence:
                     break
             try:
@@ -137,7 +159,9 @@ class ProgrammaticChatIO(ChatIO):
                 contents = contents + char
             except EOFError:
                 continue
-        return contents[:-16]
+        contents = contents[:-len_end]
+        print(f"[!OP:{role}]: {contents}", flush=True)
+        return contents
 
     def prompt_for_output(self, role: str):
         print(f"[!OP:{role}]: ", end="", flush=True)
@@ -154,6 +178,9 @@ class ProgrammaticChatIO(ChatIO):
         print(" ".join(output_text[pre:]), flush=True)
         return " ".join(output_text)
 
+    def print_output(self, text: str):
+        print(text)
+
 
 def main(args):
     if args.gpus:
@@ -162,9 +189,10 @@ def main(args):
                 f"Larger --num-gpus ({args.num_gpus}) than --gpus {args.gpus}!"
             )
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        os.environ["XPU_VISIBLE_DEVICES"] = args.gpus
 
     if args.style == "simple":
-        chatio = SimpleChatIO()
+        chatio = SimpleChatIO(args.multiline)
     elif args.style == "rich":
         chatio = RichChatIO(args.multiline, args.mouse)
     elif args.style == "programmatic":
@@ -180,18 +208,26 @@ def main(args):
             args.load_8bit,
             args.cpu_offloading,
             args.conv_template,
+            args.conv_system_msg,
             args.temperature,
             args.repetition_penalty,
             args.max_new_tokens,
             chatio,
-            GptqConfig(
+            gptq_config=GptqConfig(
                 ckpt=args.gptq_ckpt or args.model_path,
                 wbits=args.gptq_wbits,
                 groupsize=args.gptq_groupsize,
                 act_order=args.gptq_act_order,
             ),
-            args.revision,
-            args.debug,
+            awq_config=AWQConfig(
+                ckpt=args.awq_ckpt or args.model_path,
+                wbits=args.awq_wbits,
+                groupsize=args.awq_groupsize,
+            ),
+            revision=args.revision,
+            judge_sent_end=args.judge_sent_end,
+            debug=args.debug,
+            history=not args.no_history,
         )
     except KeyboardInterrupt:
         print("exit...")
@@ -203,9 +239,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--conv-template", type=str, default=None, help="Conversation prompt template."
     )
+    parser.add_argument(
+        "--conv-system-msg", type=str, default=None, help="Conversation system message."
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--style",
         type=str,
@@ -216,12 +256,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--multiline",
         action="store_true",
-        help="[Rich Style]: Enable multiline input. Use ESC+Enter for newline.",
+        help="Enable multiline input. Use ESC+Enter for newline.",
     )
     parser.add_argument(
         "--mouse",
         action="store_true",
         help="[Rich Style]: Enable mouse support for cursor positioning.",
+    )
+    parser.add_argument(
+        "--judge-sent-end",
+        action="store_true",
+        help="Whether enable the correction logic that interrupts the output of sentences due to EOS.",
     )
     parser.add_argument(
         "--debug",
