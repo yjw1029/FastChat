@@ -8,6 +8,7 @@ import json
 import os
 import random
 import time
+import jsonlines
 
 import shortuuid
 import torch
@@ -29,10 +30,27 @@ def run_eval(
     num_gpus_per_model,
     num_gpus_total,
     max_gpu_memory,
+    resume
 ):
     questions = load_questions(question_file, question_begin, question_end)
     # random shuffle the questions to balance the loading
     random.shuffle(questions)
+
+    if resume and os.path.exists(answer_file):
+        exists_qids = []
+        with jsonlines.open(answer_file) as reader:
+            for obj in reader:
+                qid = obj["question_id"]
+                exists_qids.append(qid)
+
+        filtered_questions = []
+
+        for q in questions:
+            if q["question_id"] not in exists_qids:
+                filtered_questions.append(q)
+        
+        questions = filtered_questions
+        print(f"Resume from {answer_file}. Last {len(questions)} quesitons.")
 
     # Split the question file into `num_gpus` files
     assert num_gpus_total % num_gpus_per_model == 0
@@ -228,6 +246,11 @@ if __name__ == "__main__":
         type=str,
         default=None
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Whether to resume from previous stored file. If the file does not exist test from scracth.",
+    )
     args = parser.parse_args()
 
     if args.num_gpus_total // args.num_gpus_per_model > 1:
@@ -255,6 +278,7 @@ if __name__ == "__main__":
         args.num_gpus_per_model,
         args.num_gpus_total,
         args.max_gpu_memory,
+        args.resume
     )
 
     reorg_answer_file(answer_file)

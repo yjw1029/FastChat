@@ -5,6 +5,8 @@ python gen_judgment.py --model-list [LIST-OF-MODEL-ID] --parallel [num-concurren
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import jsonlines
+import os
 
 import numpy as np
 from tqdm import tqdm
@@ -21,6 +23,7 @@ from fastchat.llm_judge.common import (
     MatchPair,
     MatchSingle,
     NEED_REF_CATS,
+    API_ERROR_OUTPUT
 )
 
 
@@ -213,6 +216,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-file", type=str, help="The name of the output file", default=None
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Whether to resume from previous stored file. If the file does not exist test from scracth.",
+    )
+
     args = parser.parse_args()
 
     question_file = f"data/{args.bench_name}/question.jsonl"
@@ -304,6 +313,35 @@ if __name__ == "__main__":
         multi_turn=True,
     )
 
+    if os.path.exists(output_file) and args.resume:
+        exists_match_ids = set()
+        exists_matchs = []
+        filter_num = 0
+        with jsonlines.open(output_file) as reader:
+            for obj in reader:
+                if obj["judgment"] != API_ERROR_OUTPUT and obj["score"] != -1:
+                    question_id = obj["question_id"]
+                    turn = obj["turn"]
+                    exists_match_ids.add(f"{question_id}-{turn}")
+                    exists_matchs.append(obj)
+                else:
+                    filter_num += 1
+
+        filtered_matches = []
+        for m in matches:
+            question_id = m.question["question_id"] 
+            turn = 1 if m.multi_turn else 2
+            match_id = f"{question_id}-{turn}"
+
+            if match_id not in exists_match_ids:
+                filtered_matches.append(m)
+        
+        matches = filtered_matches
+        print(f"Resume from {output_file}. Last {len(matches)} question. Filter {filter_num} matches in the file.")
+
+        with jsonlines.open(output_file, 'w') as writer:
+            writer.write_all(exists_matchs)
+
     match_stat = {}
     match_stat["bench_name"] = args.bench_name
     match_stat["mode"] = args.mode
@@ -317,7 +355,8 @@ if __name__ == "__main__":
     # Show match stats and prompt enter to continue
     print("Stats:")
     print(json.dumps(match_stat, indent=4))
-    input("Press Enter to confirm...")
+
+    # input("Press Enter to confirm...")
 
     # Play matches
     if args.parallel == 1:

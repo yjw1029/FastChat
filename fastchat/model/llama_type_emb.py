@@ -25,13 +25,14 @@ class LlamaModelWTypeEmbedCausalLM(LlamaForCausalLM):
     ):
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
-            batch_size, seq_len, hidden_size = inputs_embeds.size()
+            
+        batch_size, seq_len, hidden_size = inputs_embeds.size()
 
         if type_ids is None:
             type_ids = torch.zeros(batch_size, seq_len, device=inputs_embeds.device)
 
         type_embeds = self.type_embeddings(type_ids.long())
-        inputs_embeds = inputs_embeds + type_embeds
+        inputs_embeds = inputs_embeds + type_embeds.to(inputs_embeds.device)
 
         return super().forward(
             input_ids=None,

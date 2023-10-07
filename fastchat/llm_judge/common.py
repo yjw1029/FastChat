@@ -17,8 +17,8 @@ import anthropic
 from fastchat.model.model_adapter import get_conversation_template
 
 # API setting constants
-API_MAX_RETRY = 16
-API_RETRY_SLEEP = 10
+API_MAX_RETRY = 1000
+API_RETRY_SLEEP = 1
 API_ERROR_OUTPUT = "$ERROR$"
 
 TIE_DELTA = 0.1
@@ -97,11 +97,22 @@ def load_model_answers(answer_dir: str):
     The return value is a python dict of type:
     Dict[model_name: str -> Dict[question_id: int -> answer: dict]]
     """
-    filenames = glob.glob(os.path.join(answer_dir, "*.jsonl"))
-    filenames.sort()
-    model_answers = {}
+    if os.path.isdir(answer_dir):
+        filenames = glob.glob(os.path.join(answer_dir, "*.jsonl"))
+        filenames.sort()
+        model_answers = {}
 
-    for filename in filenames:
+        for filename in filenames:
+            model_name = os.path.basename(filename)[:-6]
+            answer = {}
+            with open(filename) as fin:
+                for line in fin:
+                    line = json.loads(line)
+                    answer[line["question_id"]] = line
+            model_answers[model_name] = answer
+    else:
+        model_answers = {}
+        filename = answer_dir
         model_name = os.path.basename(filename)[:-6]
         answer = {}
         with open(filename) as fin:
