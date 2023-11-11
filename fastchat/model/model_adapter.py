@@ -26,13 +26,10 @@ from transformers import (
     T5Tokenizer,
 )
 
-<<<<<<< HEAD
 from fastchat.model.llama_type_emb import LlamaModelWTypeEmbedCausalLM
 from fastchat.modules.gptq import GptqConfig, load_gptq_quantized
 from fastchat.modules.awq import AWQConfig, load_awq_quantized
-=======
 from fastchat.constants import CPU_ISA
->>>>>>> e46d97a368688554c7f1dfa2525d21dd86117fb5
 from fastchat.conversation import Conversation, get_conv_template
 from fastchat.model.compression import load_compress_model
 from fastchat.model.llama_condense_monkey_patch import replace_llama_with_condense
@@ -645,6 +642,7 @@ class VicunaAdapter(BaseModelAdapter):
                 "2. Use the old conversation template by `python3 -m fastchat.serve.cli --model-path /path/to/vicuna-v0 --conv-template one_shot`\n"
                 "3. Downgrade fschat to fschat==0.1.10 (Not recommended).\n"
             )
+
 
 class VicunaTypeEmb(VicunaAdapter):
     "Model adapater for vicuna-v1.1"
