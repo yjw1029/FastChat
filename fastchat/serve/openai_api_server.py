@@ -14,8 +14,10 @@ import logging
 import os
 from typing import Generator, Optional, Union, Dict, List, Any
 
+import aiohttp
 import fastapi
 from fastapi import Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
@@ -31,8 +33,6 @@ from fastchat.constants import (
     ErrorCode,
 )
 from fastchat.conversation import Conversation, SeparatorStyle
-from fastchat.model.model_adapter import get_conversation_template
-from fastapi.exceptions import RequestValidationError
 from fastchat.protocol.openai_api_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -49,6 +49,7 @@ from fastchat.protocol.openai_api_protocol import (
     EmbeddingsRequest,
     EmbeddingsResponse,
     ErrorResponse,
+    LogProbs,
     ModelCard,
     ModelList,
     ModelPermission,
@@ -64,6 +65,32 @@ from fastchat.protocol.api_protocol import (
 logger = logging.getLogger(__name__)
 
 conv_template_map = {}
+
+fetch_timeout = aiohttp.ClientTimeout(total=3 * 3600)
+
+
+async def fetch_remote(url, pload=None, name=None):
+    async with aiohttp.ClientSession(timeout=fetch_timeout) as session:
+        async with session.post(url, json=pload) as response:
+            chunks = []
+            if response.status != 200:
+                ret = {
+                    "text": f"{response.reason}",
+                    "error_code": ErrorCode.INTERNAL_ERROR,
+                }
+                return json.dumps(ret)
+
+            async for chunk, _ in response.content.iter_chunks():
+                chunks.append(chunk)
+        output = b"".join(chunks)
+
+    if name is not None:
+        res = json.loads(output)
+        if name != "":
+            res = res[name]
+        return res
+
+    return output
 
 
 class AppSettings(BaseSettings):
@@ -114,50 +141,31 @@ async def validation_exception_handler(request, exc):
 async def check_model(request) -> Optional[JSONResponse]:
     controller_address = app_settings.controller_address
     ret = None
-    async with httpx.AsyncClient() as client:
-        try:
-            _worker_addr = await get_worker_address(request.model, client)
-        except:
-            models_ret = await client.post(controller_address + "/list_models")
-            models = models_ret.json()["models"]
-            ret = create_error_response(
-                ErrorCode.INVALID_MODEL,
-                f"Only {'&&'.join(models)} allowed now, your model {request.model}",
-            )
+
+    models = await fetch_remote(controller_address + "/list_models", None, "models")
+    if request.model not in models:
+        ret = create_error_response(
+            ErrorCode.INVALID_MODEL,
+            f"Only {'&&'.join(models)} allowed now, your model {request.model}",
+        )
     return ret
 
 
-async def check_length(request, prompt, max_tokens):
-    async with httpx.AsyncClient() as client:
-        worker_addr = await get_worker_address(request.model, client)
+async def check_length(request, prompt, max_tokens, worker_addr):
+    if (
+        not isinstance(max_tokens, int) or max_tokens <= 0
+    ):  # model worker not support max_tokens=None
+        max_tokens = 1024 * 1024
 
-        response = await client.post(
-            worker_addr + "/model_details",
-            headers=headers,
-            json={"model": request.model},
-            timeout=WORKER_API_TIMEOUT,
-        )
-        context_len = response.json()["context_length"]
-
-        response = await client.post(
-            worker_addr + "/count_token",
-            headers=headers,
-            json={"model": request.model, "prompt": prompt},
-            timeout=WORKER_API_TIMEOUT,
-        )
-        token_num = response.json()["count"]
-
-    if token_num + max_tokens > context_len:
-        return create_error_response(
-            ErrorCode.CONTEXT_OVERFLOW,
-            f"This model's maximum context length is {context_len} tokens. "
-            f"However, you requested {max_tokens + token_num} tokens "
-            f"({token_num} in the messages, "
-            f"{max_tokens} in the completion). "
-            f"Please reduce the length of the messages or completion.",
-        )
-    else:
-        return None
+    context_len = await fetch_remote(
+        worker_addr + "/model_details", {"model": request.model}, "context_length"
+    )
+    token_num = await fetch_remote(
+        worker_addr + "/count_token",
+        {"model": request.model, "prompt": prompt},
+        "count",
+    )
+    return min(max_tokens, context_len - token_num)
 
 
 def check_requests(request) -> Optional[JSONResponse]:
@@ -192,6 +200,11 @@ def check_requests(request) -> Optional[JSONResponse]:
             ErrorCode.PARAM_OUT_OF_RANGE,
             f"{request.top_p} is greater than the maximum of 1 - 'temperature'",
         )
+    if request.top_k is not None and (request.top_k > -1 and request.top_k < 1):
+        return create_error_response(
+            ErrorCode.PARAM_OUT_OF_RANGE,
+            f"{request.top_k} is out of Range. Either set top_k to -1 or >=1.",
+        )
     if request.stop is not None and (
         not isinstance(request.stop, str) and not isinstance(request.stop, list)
     ):
@@ -217,18 +230,38 @@ def process_input(model_name, inp):
     return inp
 
 
+def create_openai_logprobs(logprob_dict):
+    """Create OpenAI-style logprobs."""
+    return LogProbs(**logprob_dict) if logprob_dict is not None else None
+
+
+def _add_to_set(s, new_stop):
+    if not s:
+        return
+    if isinstance(s, str):
+        new_stop.add(s)
+    else:
+        new_stop.update(s)
+
+
 async def get_gen_params(
     model_name: str,
+    worker_addr: str,
     messages: Union[str, List[Dict[str, str]]],
     *,
     temperature: float,
     top_p: float,
+    top_k: Optional[int],
+    presence_penalty: Optional[float],
+    frequency_penalty: Optional[float],
     max_tokens: Optional[int],
     echo: Optional[bool],
-    stream: Optional[bool],
+    logprobs: Optional[int] = None,
     stop: Optional[Union[str, List[str]]],
+    best_of: Optional[int] = None,
+    use_beam_search: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    conv = await get_conv(model_name)
+    conv = await get_conv(model_name, worker_addr)
     conv = Conversation(
         name=conv["name"],
         system_template=conv["system_template"],
@@ -261,76 +294,71 @@ async def get_gen_params(
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
 
-    if max_tokens is None:
-        max_tokens = 512
     gen_params = {
         "model": model_name,
         "prompt": prompt,
         "temperature": temperature,
+        "logprobs": logprobs,
         "top_p": top_p,
+        "top_k": top_k,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
         "max_new_tokens": max_tokens,
         "echo": echo,
-        "stream": stream,
+        "stop_token_ids": conv.stop_token_ids,
     }
 
-    if not stop:
-        gen_params.update(
-            {"stop": conv.stop_str, "stop_token_ids": conv.stop_token_ids}
-        )
-    else:
-        gen_params.update({"stop": stop})
+    if best_of is not None:
+        gen_params.update({"best_of": best_of})
+    if use_beam_search is not None:
+        gen_params.update({"use_beam_search": use_beam_search})
+
+    new_stop = set()
+    _add_to_set(stop, new_stop)
+    _add_to_set(conv.stop_str, new_stop)
+
+    gen_params["stop"] = list(new_stop)
 
     logger.debug(f"==== request ====\n{gen_params}")
     return gen_params
 
 
-async def get_worker_address(model_name: str, client: httpx.AsyncClient) -> str:
+async def get_worker_address(model_name: str) -> str:
     """
     Get worker address based on the requested model
 
     :param model_name: The worker's model name
-    :param client: The httpx client to use
     :return: Worker address from the controller
     :raises: :class:`ValueError`: No available worker for requested model
     """
     controller_address = app_settings.controller_address
-
-    ret = await client.post(
-        controller_address + "/get_worker_address", json={"model": model_name}
+    worker_addr = await fetch_remote(
+        controller_address + "/get_worker_address", {"model": model_name}, "address"
     )
-    worker_addr = ret.json()["address"]
+
     # No available worker
     if worker_addr == "":
         raise ValueError(f"No available worker for {model_name}")
-
     logger.debug(f"model_name: {model_name}, worker_addr: {worker_addr}")
     return worker_addr
 
 
-async def get_conv(model_name: str):
-    controller_address = app_settings.controller_address
-    async with httpx.AsyncClient() as client:
-        worker_addr = await get_worker_address(model_name, client)
-        conv_template = conv_template_map.get((worker_addr, model_name))
-        if conv_template is None:
-            response = await client.post(
-                worker_addr + "/worker_get_conv_template",
-                headers=headers,
-                json={"model": model_name},
-                timeout=WORKER_API_TIMEOUT,
-            )
-            conv_template = response.json()["conv"]
-            conv_template_map[(worker_addr, model_name)] = conv_template
-        return conv_template
+async def get_conv(model_name: str, worker_addr: str):
+    conv_template = conv_template_map.get((worker_addr, model_name))
+    if conv_template is None:
+        conv_template = await fetch_remote(
+            worker_addr + "/worker_get_conv_template", {"model": model_name}, "conv"
+        )
+        conv_template_map[(worker_addr, model_name)] = conv_template
+    return conv_template
 
 
 @app.get("/v1/models", dependencies=[Depends(check_api_key)])
 async def show_available_models():
     controller_address = app_settings.controller_address
-    async with httpx.AsyncClient() as client:
-        ret = await client.post(controller_address + "/refresh_all_workers")
-        ret = await client.post(controller_address + "/list_models")
-    models = ret.json()["models"]
+    ret = await fetch_remote(controller_address + "/refresh_all_workers")
+    models = await fetch_remote(controller_address + "/list_models", None, "models")
+
     models.sort()
     # TODO: return real model permission details
     model_cards = []
@@ -349,32 +377,38 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if error_check_ret is not None:
         return error_check_ret
 
+    worker_addr = await get_worker_address(request.model)
+
     gen_params = await get_gen_params(
         request.model,
+        worker_addr,
         request.messages,
         temperature=request.temperature,
         top_p=request.top_p,
+        top_k=request.top_k,
+        presence_penalty=request.presence_penalty,
+        frequency_penalty=request.frequency_penalty,
         max_tokens=request.max_tokens,
         echo=False,
-        stream=request.stream,
         stop=request.stop,
     )
-    error_check_ret = await check_length(
-        request, gen_params["prompt"], gen_params["max_new_tokens"]
+    gen_params["max_new_tokens"] = await check_length(
+        request,
+        gen_params["prompt"],
+        gen_params["max_new_tokens"],
+        worker_addr,
     )
-    if error_check_ret is not None:
-        return error_check_ret
 
     if request.stream:
         generator = chat_completion_stream_generator(
-            request.model, gen_params, request.n
+            request.model, gen_params, request.n, worker_addr
         )
         return StreamingResponse(generator, media_type="text/event-stream")
 
     choices = []
     chat_completions = []
     for i in range(request.n):
-        content = asyncio.create_task(generate_completion(gen_params))
+        content = asyncio.create_task(generate_completion(gen_params, worker_addr))
         chat_completions.append(content)
     try:
         all_tasks = await asyncio.gather(*chat_completions)
@@ -400,7 +434,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 
 async def chat_completion_stream_generator(
-    model_name: str, gen_params: Dict[str, Any], n: int
+    model_name: str, gen_params: Dict[str, Any], n: int, worker_addr: str
 ) -> Generator[str, Any, None]:
     """
     Event stream format:
@@ -421,14 +455,18 @@ async def chat_completion_stream_generator(
         yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
 
         previous_text = ""
-        async for content in generate_completion_stream(gen_params):
+        async for content in generate_completion_stream(gen_params, worker_addr):
             if content["error_code"] != 0:
                 yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             decoded_unicode = content["text"].replace("\ufffd", "")
             delta_text = decoded_unicode[len(previous_text) :]
-            previous_text = decoded_unicode
+            previous_text = (
+                decoded_unicode
+                if len(decoded_unicode) > len(previous_text)
+                else previous_text
+            )
 
             if len(delta_text) == 0:
                 delta_text = None
@@ -462,29 +500,40 @@ async def create_completion(request: CompletionRequest):
 
     request.prompt = process_input(request.model, request.prompt)
 
+    worker_addr = await get_worker_address(request.model)
     for text in request.prompt:
-        error_check_ret = await check_length(request, text, request.max_tokens)
-        if error_check_ret is not None:
-            return error_check_ret
+        max_tokens = await check_length(request, text, request.max_tokens, worker_addr)
+        if isinstance(max_tokens, int) and max_tokens < request.max_tokens:
+            request.max_tokens = max_tokens
 
     if request.stream:
-        generator = generate_completion_stream_generator(request, request.n)
+        generator = generate_completion_stream_generator(
+            request, request.n, worker_addr
+        )
         return StreamingResponse(generator, media_type="text/event-stream")
     else:
         text_completions = []
         for text in request.prompt:
             gen_params = await get_gen_params(
                 request.model,
+                worker_addr,
                 text,
                 temperature=request.temperature,
                 top_p=request.top_p,
+                top_k=request.top_k,
+                frequency_penalty=request.frequency_penalty,
+                presence_penalty=request.presence_penalty,
                 max_tokens=request.max_tokens,
+                logprobs=request.logprobs,
                 echo=request.echo,
-                stream=request.stream,
                 stop=request.stop,
+                best_of=request.best_of,
+                use_beam_search=request.use_beam_search,
             )
             for i in range(request.n):
-                content = asyncio.create_task(generate_completion(gen_params))
+                content = asyncio.create_task(
+                    generate_completion(gen_params, worker_addr)
+                )
                 text_completions.append(content)
 
         try:
@@ -501,7 +550,7 @@ async def create_completion(request: CompletionRequest):
                 CompletionResponseChoice(
                     index=i,
                     text=content["text"],
-                    logprobs=content.get("logprobs", None),
+                    logprobs=create_openai_logprobs(content.get("logprobs", None)),
                     finish_reason=content.get("finish_reason", "stop"),
                 )
             )
@@ -514,7 +563,9 @@ async def create_completion(request: CompletionRequest):
         )
 
 
-async def generate_completion_stream_generator(request: CompletionRequest, n: int):
+async def generate_completion_stream_generator(
+    request: CompletionRequest, n: int, worker_addr: str
+):
     model_name = request.model
     id = f"cmpl-{shortuuid.random()}"
     finish_stream_events = []
@@ -523,27 +574,35 @@ async def generate_completion_stream_generator(request: CompletionRequest, n: in
             previous_text = ""
             gen_params = await get_gen_params(
                 request.model,
+                worker_addr,
                 text,
                 temperature=request.temperature,
                 top_p=request.top_p,
+                top_k=request.top_k,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
                 max_tokens=request.max_tokens,
+                logprobs=request.logprobs,
                 echo=request.echo,
-                stream=request.stream,
                 stop=request.stop,
             )
-            async for content in generate_completion_stream(gen_params):
+            async for content in generate_completion_stream(gen_params, worker_addr):
                 if content["error_code"] != 0:
                     yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 decoded_unicode = content["text"].replace("\ufffd", "")
                 delta_text = decoded_unicode[len(previous_text) :]
-                previous_text = decoded_unicode
+                previous_text = (
+                    decoded_unicode
+                    if len(decoded_unicode) > len(previous_text)
+                    else previous_text
+                )
                 # todo: index is not apparent
                 choice_data = CompletionResponseStreamChoice(
                     index=i,
                     text=delta_text,
-                    logprobs=content.get("logprobs", None),
+                    logprobs=create_openai_logprobs(content.get("logprobs", None)),
                     finish_reason=content.get("finish_reason", None),
                 )
                 chunk = CompletionStreamResponse(
@@ -563,10 +622,9 @@ async def generate_completion_stream_generator(request: CompletionRequest, n: in
     yield "data: [DONE]\n\n"
 
 
-async def generate_completion_stream(payload: Dict[str, Any]):
+async def generate_completion_stream(payload: Dict[str, Any], worker_addr: str):
     controller_address = app_settings.controller_address
     async with httpx.AsyncClient() as client:
-        worker_addr = await get_worker_address(payload["model"], client)
         delimiter = b"\0"
         async with client.stream(
             "POST",
@@ -576,26 +634,18 @@ async def generate_completion_stream(payload: Dict[str, Any]):
             timeout=WORKER_API_TIMEOUT,
         ) as response:
             # content = await response.aread()
+            buffer = b""
             async for raw_chunk in response.aiter_raw():
-                for chunk in raw_chunk.split(delimiter):
+                buffer += raw_chunk
+                while (chunk_end := buffer.find(delimiter)) >= 0:
+                    chunk, buffer = buffer[:chunk_end], buffer[chunk_end + 1 :]
                     if not chunk:
                         continue
-                    data = json.loads(chunk.decode())
-                    yield data
+                    yield json.loads(chunk.decode())
 
 
-async def generate_completion(payload: Dict[str, Any]):
-    async with httpx.AsyncClient() as client:
-        worker_addr = await get_worker_address(payload["model"], client)
-
-        response = await client.post(
-            worker_addr + "/worker_generate",
-            headers=headers,
-            json=payload,
-            timeout=WORKER_API_TIMEOUT,
-        )
-        completion = response.json()
-        return completion
+async def generate_completion(payload: Dict[str, Any], worker_addr: str):
+    return await fetch_remote(worker_addr + "/worker_generate", payload, "")
 
 
 @app.post("/v1/embeddings", dependencies=[Depends(check_api_key)])
@@ -621,6 +671,7 @@ async def create_embeddings(request: EmbeddingsRequest, model_name: str = None):
         payload = {
             "model": request.model,
             "input": batch,
+            "encoding_format": request.encoding_format,
         }
         embedding = await get_embedding(payload)
         if "error_code" in embedding and embedding["error_code"] != 0:
@@ -648,17 +699,10 @@ async def create_embeddings(request: EmbeddingsRequest, model_name: str = None):
 async def get_embedding(payload: Dict[str, Any]):
     controller_address = app_settings.controller_address
     model_name = payload["model"]
-    async with httpx.AsyncClient() as client:
-        worker_addr = await get_worker_address(model_name, client)
+    worker_addr = await get_worker_address(model_name)
 
-        response = await client.post(
-            worker_addr + "/worker_get_embeddings",
-            headers=headers,
-            json=payload,
-            timeout=WORKER_API_TIMEOUT,
-        )
-        embedding = response.json()
-        return embedding
+    embedding = await fetch_remote(worker_addr + "/worker_get_embeddings", payload)
+    return json.loads(embedding)
 
 
 ### GENERAL API - NOT OPENAI COMPATIBLE ###
@@ -671,35 +715,30 @@ async def count_tokens(request: APITokenCheckRequest):
     This is not part of the OpenAI API spec.
     """
     checkedList = []
-    async with httpx.AsyncClient() as client:
-        for item in request.prompts:
-            worker_addr = await get_worker_address(item.model, client)
+    for item in request.prompts:
+        worker_addr = await get_worker_address(item.model)
 
-            response = await client.post(
-                worker_addr + "/model_details",
-                headers=headers,
-                json={"model": item.model},
-                timeout=WORKER_API_TIMEOUT,
+        context_len = await fetch_remote(
+            worker_addr + "/model_details",
+            {"prompt": item.prompt, "model": item.model},
+            "context_length",
+        )
+
+        token_num = await fetch_remote(
+            worker_addr + "/count_token",
+            {"prompt": item.prompt, "model": item.model},
+            "count",
+        )
+
+        can_fit = True
+        if token_num + item.max_tokens > context_len:
+            can_fit = False
+
+        checkedList.append(
+            APITokenCheckResponseItem(
+                fits=can_fit, contextLength=context_len, tokenCount=token_num
             )
-            context_len = response.json()["context_length"]
-
-            response = await client.post(
-                worker_addr + "/count_token",
-                headers=headers,
-                json={"prompt": item.prompt, "model": item.model},
-                timeout=WORKER_API_TIMEOUT,
-            )
-            token_num = response.json()["count"]
-
-            can_fit = True
-            if token_num + item.max_tokens > context_len:
-                can_fit = False
-
-            checkedList.append(
-                APITokenCheckResponseItem(
-                    fits=can_fit, contextLength=context_len, tokenCount=token_num
-                )
-            )
+        )
 
     return APITokenCheckResponse(prompts=checkedList)
 
@@ -714,36 +753,42 @@ async def create_chat_completion(request: APIChatCompletionRequest):
     if error_check_ret is not None:
         return error_check_ret
 
+    worker_addr = await get_worker_address(request.model)
+
     gen_params = await get_gen_params(
         request.model,
+        worker_addr,
         request.messages,
         temperature=request.temperature,
         top_p=request.top_p,
+        top_k=request.top_k,
+        presence_penalty=request.presence_penalty,
+        frequency_penalty=request.frequency_penalty,
         max_tokens=request.max_tokens,
         echo=False,
-        stream=request.stream,
         stop=request.stop,
     )
 
     if request.repetition_penalty is not None:
         gen_params["repetition_penalty"] = request.repetition_penalty
 
-    error_check_ret = await check_length(
-        request, gen_params["prompt"], gen_params["max_new_tokens"]
+    gen_params["max_new_tokens"] = await check_length(
+        request,
+        gen_params["prompt"],
+        gen_params["max_new_tokens"],
+        worker_addr,
     )
-    if error_check_ret is not None:
-        return error_check_ret
 
     if request.stream:
         generator = chat_completion_stream_generator(
-            request.model, gen_params, request.n
+            request.model, gen_params, request.n, worker_addr
         )
         return StreamingResponse(generator, media_type="text/event-stream")
 
     choices = []
     chat_completions = []
     for i in range(request.n):
-        content = asyncio.create_task(generate_completion(gen_params))
+        content = asyncio.create_task(generate_completion(gen_params, worker_addr))
         chat_completions.append(content)
     try:
         all_tasks = await asyncio.gather(*chat_completions)
@@ -770,7 +815,7 @@ async def create_chat_completion(request: APIChatCompletionRequest):
 ### END GENERAL API - NOT OPENAI COMPATIBLE ###
 
 
-if __name__ == "__main__":
+def create_openai_api_server():
     parser = argparse.ArgumentParser(
         description="FastChat ChatGPT-Compatible RESTful API server."
     )
@@ -796,6 +841,13 @@ if __name__ == "__main__":
         type=lambda s: s.split(","),
         help="Optional list of comma separated API keys",
     )
+    parser.add_argument(
+        "--ssl",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Enable SSL. Requires OS Environment variables 'SSL_KEYFILE' and 'SSL_CERTFILE'.",
+    )
     args = parser.parse_args()
 
     app.add_middleware(
@@ -809,5 +861,19 @@ if __name__ == "__main__":
     app_settings.api_keys = args.api_keys
 
     logger.info(f"args: {args}")
+    return args
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+if __name__ == "__main__":
+    args = create_openai_api_server()
+    if args.ssl:
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            ssl_keyfile=os.environ["SSL_KEYFILE"],
+            ssl_certfile=os.environ["SSL_CERTFILE"],
+        )
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")

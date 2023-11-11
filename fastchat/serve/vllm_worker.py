@@ -11,15 +11,14 @@ from typing import List
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
-import torch
 import uvicorn
 from vllm import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
+from fastchat.serve.base_model_worker import BaseModelWorker
 from fastchat.serve.model_worker import (
-    BaseModelWorker,
     logger,
     worker_id,
 )
@@ -40,6 +39,7 @@ class VLLMWorker(BaseModelWorker):
         limit_worker_concurrency: int,
         no_register: bool,
         llm_engine: AsyncLLMEngine,
+        conv_template: str,
     ):
         super().__init__(
             controller_addr,
@@ -48,6 +48,7 @@ class VLLMWorker(BaseModelWorker):
             model_path,
             model_names,
             limit_worker_concurrency,
+            conv_template,
         )
 
         logger.info(
@@ -66,34 +67,45 @@ class VLLMWorker(BaseModelWorker):
         request_id = params.pop("request_id")
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
+        top_k = params.get("top_k", -1.0)
+        presence_penalty = float(params.get("presence_penalty", 0.0))
+        frequency_penalty = float(params.get("frequency_penalty", 0.0))
         max_new_tokens = params.get("max_new_tokens", 256)
         stop_str = params.get("stop", None)
         stop_token_ids = params.get("stop_token_ids", None) or []
-        stop_token_ids.append(self.tokenizer.eos_token_id)
+        if self.tokenizer.eos_token_id is not None:
+            stop_token_ids.append(self.tokenizer.eos_token_id)
         echo = params.get("echo", True)
+        use_beam_search = params.get("use_beam_search", False)
+        best_of = params.get("best_of", None)
 
         # Handle stop_str
+        stop = set()
         if isinstance(stop_str, str) and stop_str != "":
-            stop = [stop_str]
+            stop.add(stop_str)
         elif isinstance(stop_str, list) and stop_str != []:
-            stop = stop_str
-        else:
-            stop = []
+            stop.update(stop_str)
 
         for tid in stop_token_ids:
-            stop.append(self.tokenizer.decode(tid))
+            if tid is not None:
+                stop.add(self.tokenizer.decode(tid))
 
         # make sampling params in vllm
         top_p = max(top_p, 1e-5)
         if temperature <= 1e-5:
             top_p = 1.0
+
         sampling_params = SamplingParams(
             n=1,
             temperature=temperature,
             top_p=top_p,
-            use_beam_search=False,
-            stop=stop,
+            use_beam_search=use_beam_search,
+            stop=list(stop),
             max_tokens=max_new_tokens,
+            top_k=top_k,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            best_of=best_of,
         )
         results_generator = engine.generate(context, sampling_params, request_id)
 
@@ -107,7 +119,25 @@ class VLLMWorker(BaseModelWorker):
                 text_outputs = [output.text for output in request_output.outputs]
             text_outputs = " ".join(text_outputs)
             # Note: usage is not supported yet
-            ret = {"text": text_outputs, "error_code": 0, "usage": {}}
+            prompt_tokens = len(request_output.prompt_token_ids)
+            completion_tokens = sum(
+                len(output.token_ids) for output in request_output.outputs
+            )
+            ret = {
+                "text": text_outputs,
+                "error_code": 0,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                "cumulative_logprob": [
+                    output.cumulative_logprob for output in request_output.outputs
+                ],
+                "finish_reason": request_output.outputs[0].finish_reason
+                if len(request_output.outputs) == 1
+                else [output.finish_reason for output in request_output.outputs],
+            }
             yield (json.dumps(ret) + "\0").encode()
 
     async def generate(self, params):
@@ -188,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--controller-address", type=str, default="http://localhost:21001"
     )
-    parser.add_argument("--model-path", type=str, default="lmsys/vicuna-7b-v1.3")
+    parser.add_argument("--model-path", type=str, default="lmsys/vicuna-7b-v1.5")
     parser.add_argument(
         "--model-names",
         type=lambda s: s.split(","),
@@ -197,6 +227,26 @@ if __name__ == "__main__":
     parser.add_argument("--limit-worker-concurrency", type=int, default=1024)
     parser.add_argument("--no-register", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument(
+        "--conv-template", type=str, default=None, help="Conversation prompt template."
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_false",
+        default=True,
+        help="Trust remote code (e.g., from HuggingFace) when"
+        "downloading the model and tokenizer.",
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="The ratio (between 0 and 1) of GPU memory to"
+        "reserve for the model weights, activations, and KV cache. Higher"
+        "values will increase the KV cache size and thus improve the model's"
+        "throughput. However, if the value is too high, it may cause out-of-"
+        "memory (OOM) errors.",
+    )
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
@@ -216,5 +266,6 @@ if __name__ == "__main__":
         args.limit_worker_concurrency,
         args.no_register,
         engine,
+        args.conv_template,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

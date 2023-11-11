@@ -35,8 +35,10 @@ from fastchat.model.model_adapter import (
     get_conversation_template,
     get_generate_stream_function,
 )
-from fastchat.modules.gptq import GptqConfig
 from fastchat.modules.awq import AWQConfig
+from fastchat.modules.gptq import GptqConfig
+from fastchat.modules.exllama import ExllamaConfig
+from fastchat.modules.xfastertransformer import XftConfig
 from fastchat.utils import is_partial_stop, is_sentence_complete, get_context_length
 
 
@@ -66,6 +68,9 @@ def generate_stream(
     stream_interval: int = 2,
     judge_sent_end: bool = False,
 ):
+    if hasattr(model, "device"):
+        device = model.device
+
     # Read parameters
     prompt = params["prompt"]
     len_prompt = len(prompt)
@@ -74,10 +79,12 @@ def generate_stream(
     top_p = float(params.get("top_p", 1.0))
     top_k = int(params.get("top_k", -1))  # -1 means disable
     max_new_tokens = int(params.get("max_new_tokens", 256))
+    logprobs = params.get("logprobs", None)  # FIXME: Support logprobs>1.
     echo = bool(params.get("echo", True))
     stop_str = params.get("stop", None)
     stop_token_ids = params.get("stop_token_ids", None) or []
-    stop_token_ids.append(tokenizer.eos_token_id)
+    if tokenizer.eos_token_id not in stop_token_ids:
+        stop_token_ids.append(tokenizer.eos_token_id)
 
     logits_processor = prepare_logits_processor(
         temperature, repetition_penalty, top_p, top_k
@@ -94,6 +101,8 @@ def generate_stream(
     input_echo_len = len(input_ids)
 
     if model.config.is_encoder_decoder:
+        if logprobs is not None:  # FIXME: Support logprobs for encoder-decoder models.
+            raise NotImplementedError
         encoder_output = model.encoder(
             input_ids=torch.as_tensor([input_ids], device=device)
         )[0]
@@ -102,9 +111,13 @@ def generate_stream(
             dtype=torch.int64,
             device=device,
         )
+    else:
+        start_ids = torch.as_tensor([input_ids], device=device)
 
     past_key_values = out = None
+    token_logprobs = [None]  # The first token has no logprobs.
     sent_interrupt = False
+    finish_reason = None
     for i in range(max_new_tokens):
         if i == 0:  # prefill
             if model.config.is_encoder_decoder:
@@ -115,14 +128,25 @@ def generate_stream(
                 )
                 logits = model.lm_head(out[0])
             else:
-                out = model(torch.as_tensor([input_ids], device=device), use_cache=True)
+                out = model(input_ids=start_ids, use_cache=True)
                 logits = out.logits
             past_key_values = out.past_key_values
+
+            if logprobs is not None:
+                # Prefull logprobs for the prompt.
+                shift_input_ids = start_ids[..., 1:].contiguous()
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_logits = torch.log_softmax(shift_logits, dim=-1).tolist()
+                for label_id, logit in zip(
+                    shift_input_ids[0].tolist(), shift_logits[0]
+                ):
+                    token_logprobs.append(logit[label_id])
         else:  # decoding
             if model.config.is_encoder_decoder:
                 out = model.decoder(
                     input_ids=torch.as_tensor(
-                        [[token] if not sent_interrupt else output_ids], device=device
+                        [[token] if not sent_interrupt else output_ids],
+                        device=device,
                     ),
                     encoder_hidden_states=encoder_output,
                     use_cache=True,
@@ -134,7 +158,8 @@ def generate_stream(
             else:
                 out = model(
                     input_ids=torch.as_tensor(
-                        [[token] if not sent_interrupt else output_ids], device=device
+                        [[token] if not sent_interrupt else output_ids],
+                        device=device,
                     ),
                     use_cache=True,
                     past_key_values=past_key_values if not sent_interrupt else None,
@@ -165,6 +190,11 @@ def generate_stream(
             tokens = [int(token) for token in indices.tolist()]
         token = tokens[0]
         output_ids.append(token)
+        if logprobs is not None:
+            # Cannot use last_token_logits because logprobs is based on raw logits.
+            token_logprobs.append(
+                torch.log_softmax(logits[0, -1, :], dim=-1)[token].tolist()
+            )
 
         if token in stop_token_ids:
             stopped = True
@@ -186,6 +216,28 @@ def generate_stream(
                 spaces_between_special_tokens=False,
                 clean_up_tokenization_spaces=True,
             )
+            ret_logprobs = None
+            if logprobs is not None:
+                ret_logprobs = {
+                    "text_offset": [],
+                    "tokens": [
+                        tokenizer.decode(token)
+                        for token in (
+                            output_ids if echo else output_ids[input_echo_len:]
+                        )
+                    ],
+                    "token_logprobs": token_logprobs
+                    if echo
+                    else token_logprobs[input_echo_len:],
+                    "top_logprobs": [{}]
+                    * len(token_logprobs if echo else token_logprobs[input_echo_len:]),
+                }
+                # Compute text_offset
+                curr_pos = 0
+                for text in ret_logprobs["tokens"]:
+                    ret_logprobs["text_offset"].append(curr_pos)
+                    curr_pos += len(text)
+
             # TODO: For the issue of incomplete sentences interrupting output, apply a patch and others can also modify it to a more elegant way
             if judge_sent_end and stopped and not is_sentence_complete(output):
                 if len(tokens) > 1:
@@ -223,6 +275,7 @@ def generate_stream(
             if not partially_stopped:
                 yield {
                     "text": output,
+                    "logprobs": ret_logprobs,
                     "usage": {
                         "prompt_tokens": input_echo_len,
                         "completion_tokens": i,
@@ -235,15 +288,15 @@ def generate_stream(
             break
 
     # Finish stream event, which contains finish reason
-    if i == max_new_tokens - 1:
-        finish_reason = "length"
-    elif stopped:
-        finish_reason = "stop"
     else:
-        finish_reason = None
+        finish_reason = "length"
+
+    if stopped:
+        finish_reason = "stop"
 
     yield {
         "text": output,
+        "logprobs": ret_logprobs,
         "usage": {
             "prompt_tokens": input_echo_len,
             "completion_tokens": i,
@@ -258,6 +311,8 @@ def generate_stream(
     torch.cuda.empty_cache()
     if device == "xpu":
         torch.xpu.empty_cache()
+    if device == "npu":
+        torch.npu.empty_cache()
 
 
 class ChatIO(abc.ABC):
@@ -283,6 +338,7 @@ def chat_loop(
     device: str,
     num_gpus: int,
     max_gpu_memory: str,
+    dtype: Optional[torch.dtype],
     load_8bit: bool,
     cpu_offloading: bool,
     conv_template: Optional[str],
@@ -293,6 +349,8 @@ def chat_loop(
     chatio: ChatIO,
     gptq_config: Optional[GptqConfig] = None,
     awq_config: Optional[AWQConfig] = None,
+    exllama_config: Optional[ExllamaConfig] = None,
+    xft_config: Optional[XftConfig] = None,
     revision: str = "main",
     judge_sent_end: bool = True,
     debug: bool = True,
@@ -304,10 +362,13 @@ def chat_loop(
         device=device,
         num_gpus=num_gpus,
         max_gpu_memory=max_gpu_memory,
+        dtype=dtype,
         load_8bit=load_8bit,
         cpu_offloading=cpu_offloading,
         gptq_config=gptq_config,
         awq_config=awq_config,
+        exllama_config=exllama_config,
+        xft_config=xft_config,
         revision=revision,
         debug=debug,
     )
@@ -316,6 +377,7 @@ def chat_loop(
     model_type = str(type(model)).lower()
     is_t5 = "t5" in model_type
     is_codet5p = "codet5p" in model_type
+    is_xft = "xft" in model_type
 
     # Hardcode T5's default repetition penalty to be 1.2
     if is_t5 and repetition_penalty == 1.0:
@@ -333,6 +395,14 @@ def chat_loop(
         if conv_system_msg is not None:
             conv.set_system_message(conv_system_msg)
         return conv
+
+    def reload_conv(conv):
+        """
+        Reprints the conversation from the start.
+        """
+        for message in conv.messages[conv.offset :]:
+            chatio.prompt_for_output(message[0])
+            chatio.print_output(message[1])
 
     conv = None
 
@@ -352,6 +422,37 @@ def chat_loop(
             print("resetting...")
             conv = new_chat()
             continue
+        elif inp == "!!remove":
+            print("removing last message...")
+            if len(conv.messages) > conv.offset:
+                # Assistant
+                if conv.messages[-1][0] == conv.roles[1]:
+                    conv.messages.pop()
+                # User
+                if conv.messages[-1][0] == conv.roles[0]:
+                    conv.messages.pop()
+                reload_conv(conv)
+            else:
+                print("No messages to remove.")
+            continue
+        elif inp == "!!regen":
+            print("regenerating last message...")
+            if len(conv.messages) > conv.offset:
+                # Assistant
+                if conv.messages[-1][0] == conv.roles[1]:
+                    conv.messages.pop()
+                # User
+                if conv.messages[-1][0] == conv.roles[0]:
+                    reload_conv(conv)
+                    # Set inp to previous message
+                    inp = conv.messages.pop()[1]
+                else:
+                    # Shouldn't happen in normal circumstances
+                    print("No user message to regenerate from.")
+                    continue
+            else:
+                print("No messages to regenerate.")
+                continue
         elif inp.startswith("!!save"):
             args = inp.split(" ", 1)
 
@@ -361,7 +462,8 @@ def chat_loop(
             else:
                 filename = args[1]
 
-            if not filename.endswith(".json"):
+            # Add .json if extension not present
+            if not "." in filename:
                 filename += ".json"
 
             print("saving...", filename)
@@ -394,9 +496,7 @@ def chat_loop(
             conv = get_conv_template(new_conv["template_name"])
             conv.set_system_message(new_conv["system_message"])
             conv.messages = new_conv["messages"]
-            for message in conv.messages[conv.offset :]:
-                chatio.prompt_for_output(message[0])
-                chatio.print_output(message[1])
+            reload_conv(conv)
             continue
 
         conv.append_message(conv.roles[0], inp)
@@ -417,26 +517,38 @@ def chat_loop(
             "echo": False,
         }
 
-        chatio.prompt_for_output(conv.roles[1])
-        output_stream = generate_stream_func(
-            model,
-            tokenizer,
-            gen_params,
-            device,
-            context_len=context_len,
-            judge_sent_end=judge_sent_end,
-        )
-        t = time.time()
-        outputs = chatio.stream_output(output_stream)
-        duration = time.time() - t
-        conv.update_last_message(outputs.strip())
+        try:
+            chatio.prompt_for_output(conv.roles[1])
+            output_stream = generate_stream_func(
+                model,
+                tokenizer,
+                gen_params,
+                device,
+                context_len=context_len,
+                judge_sent_end=judge_sent_end,
+            )
+            t = time.time()
+            outputs = chatio.stream_output(output_stream)
+            duration = time.time() - t
+            conv.update_last_message(outputs.strip())
 
-        if debug:
-            num_tokens = len(tokenizer.encode(outputs))
-            msg = {
-                "conv_template": conv.name,
-                "prompt": prompt,
-                "outputs": outputs,
-                "speed (token/s)": round(num_tokens / duration, 2),
-            }
-            print(f"\n{msg}\n")
+            if debug:
+                num_tokens = len(tokenizer.encode(outputs))
+                msg = {
+                    "conv_template": conv.name,
+                    "prompt": prompt,
+                    "outputs": outputs,
+                    "speed (token/s)": round(num_tokens / duration, 2),
+                }
+                print(f"\n{msg}\n")
+
+        except KeyboardInterrupt:
+            print("stopped generation.")
+            # If generation didn't finish
+            if conv.messages[-1][1] is None:
+                conv.messages.pop()
+                # Remove last user message, so there isn't a double up
+                if conv.messages[-1][0] == conv.roles[0]:
+                    conv.messages.pop()
+
+                reload_conv(conv)

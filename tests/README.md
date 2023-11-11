@@ -1,3 +1,5 @@
+## Unit tests for FastChat
+
 ### Test CLI Inference
 
 ```
