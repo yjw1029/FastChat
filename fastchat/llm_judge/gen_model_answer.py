@@ -54,6 +54,10 @@ def run_eval(
         questions = filtered_questions
         print(f"Resume from {answer_file}. Last {len(questions)} quesitons.")
 
+    if len(questions) == 0:
+        print(f"Already finish. exit.")
+        exit(0)
+
     # Split the question file into `num_gpus` files
     assert num_gpus_total % num_gpus_per_model == 0
     use_ray = num_gpus_total // num_gpus_per_model > 1
